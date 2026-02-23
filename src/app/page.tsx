@@ -399,15 +399,51 @@ export default function Home() {
     };
   }, []);
 
+  const renderOnMainThread = useCallback(
+    (sourceCanvas: HTMLCanvasElement, mosaicCanvas: HTMLCanvasElement): boolean => {
+      const options = {
+        tileSize,
+        colorCount,
+        showGrout,
+        style,
+        dithering,
+        customPalette: useCustomPalette ? customPaletteRgb : undefined,
+      };
+
+      try {
+        const palette = renderMosaic(sourceCanvas, mosaicCanvas, options);
+        if (!useCustomPalette && palette.length > 0) {
+          const nextPalette = normalizePaletteLength(palette.map((color) => rgbToHex(color)), colorCount);
+          setCustomPalette((prev) => mergePaletteWithLocks(nextPalette, prev, lockedPalette));
+        }
+        latestMetaRef.current = null;
+        setGuidedStep((prev) => Math.max(prev, 3));
+        setError(null);
+        commitRenderMetrics("main-thread");
+        return true;
+      } catch {
+        setError("No pudimos generar el mosaico.");
+        return false;
+      }
+    },
+    [colorCount, commitRenderMetrics, customPaletteRgb, dithering, lockedPalette, showGrout, style, tileSize, useCustomPalette],
+  );
+
   useEffect(() => {
     if (typeof window === "undefined" || typeof Worker === "undefined") {
       return;
     }
 
-    const workers = [
-      new Worker(new URL("../workers/mosaic.worker.ts", import.meta.url)),
-      new Worker(new URL("../workers/mosaic.worker.ts", import.meta.url)),
-    ];
+    let workers: Worker[] = [];
+    try {
+      workers = [
+        new Worker(new URL("../workers/mosaic.worker.ts", import.meta.url)),
+        new Worker(new URL("../workers/mosaic.worker.ts", import.meta.url)),
+      ];
+    } catch {
+      workersRef.current = [];
+      return;
+    }
     workersRef.current = workers;
 
     const onWorkerMessage = (event: MessageEvent<MosaicWorkerResponse>) => {
@@ -423,6 +459,23 @@ export default function Home() {
 
       const context = mosaicCanvas.getContext("2d");
       if (!context) {
+        return;
+      }
+
+      if (workerError) {
+        const sourceCanvas = sourceCanvasRef.current;
+        if (!sourceCanvas) {
+          setIsProcessing(false);
+          setError("No pudimos procesar la imagen en segundo plano.");
+          return;
+        }
+
+        renderModeRef.current = "main-thread";
+        const ok = renderOnMainThread(sourceCanvas, mosaicCanvas);
+        setIsProcessing(false);
+        if (!ok) {
+          setError("No pudimos procesar la imagen en segundo plano.");
+        }
         return;
       }
 
@@ -449,12 +502,24 @@ export default function Home() {
       setIsProcessing(false);
       setGuidedStep((prev) => Math.max(prev, 3));
       commitRenderMetrics(renderModeRef.current);
-      setError(workerError ? "No pudimos procesar la imagen en segundo plano." : null);
+      setError(null);
     };
 
     const onWorkerError = () => {
+      const sourceCanvas = sourceCanvasRef.current;
+      const mosaicCanvas = mosaicCanvasRef.current;
+      if (!sourceCanvas || !mosaicCanvas) {
+        setIsProcessing(false);
+        setError("No pudimos procesar la imagen en segundo plano.");
+        return;
+      }
+
+      renderModeRef.current = "main-thread";
+      const ok = renderOnMainThread(sourceCanvas, mosaicCanvas);
       setIsProcessing(false);
-      setError("No pudimos procesar la imagen en segundo plano.");
+      if (!ok) {
+        setError("No pudimos procesar la imagen en segundo plano.");
+      }
     };
 
     workers.forEach((worker) => {
@@ -466,7 +531,7 @@ export default function Home() {
       workers.forEach((worker) => worker.terminate());
       workersRef.current = [];
     };
-  }, [colorCount, commitRenderMetrics, customPalette, dithering, lockedPalette, showGrout, style, tileSize, useCustomPalette]);
+  }, [colorCount, commitRenderMetrics, customPalette, dithering, lockedPalette, renderOnMainThread, showGrout, style, tileSize, useCustomPalette]);
 
   const processCurrentImage = useCallback(() => {
     const sourceCanvas = sourceCanvasRef.current;
@@ -550,41 +615,39 @@ export default function Home() {
         return;
       }
 
-      const context = sourceCanvas.getContext("2d", { willReadFrequently: true });
-      if (!context) {
-        setError("No se pudo leer el canvas de origen.");
+      try {
+        const context = sourceCanvas.getContext("2d", { willReadFrequently: true });
+        if (!context) {
+          setError("No se pudo leer el canvas de origen.");
+          setIsProcessing(false);
+          return;
+        }
+        const imageData = context.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
+        const payload: MosaicWorkerRequest = {
+          jobId: currentJobId,
+          mode: "pixels",
+          width: sourceCanvas.width,
+          height: sourceCanvas.height,
+          pixels: imageData.data,
+          options,
+        };
+        renderModeRef.current = "pixels-worker";
+        worker.postMessage(payload);
+        return;
+      } catch {
+        renderModeRef.current = "main-thread";
+        const ok = renderOnMainThread(sourceCanvas, mosaicCanvas);
         setIsProcessing(false);
+        if (!ok) {
+          setError("No pudimos generar el mosaico.");
+        }
         return;
       }
-      const imageData = context.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
-      const payload: MosaicWorkerRequest = {
-        jobId: currentJobId,
-        mode: "pixels",
-        width: sourceCanvas.width,
-        height: sourceCanvas.height,
-        pixels: imageData.data,
-        options,
-      };
-      renderModeRef.current = "pixels-worker";
-      worker.postMessage(payload);
-      return;
     }
 
-    try {
-      renderModeRef.current = "main-thread";
-      const palette = renderMosaic(sourceCanvas, mosaicCanvas, options);
-      if (!useCustomPalette && palette.length > 0) {
-        const nextPalette = normalizePaletteLength(palette.map((color) => rgbToHex(color)), colorCount);
-        setCustomPalette((prev) => mergePaletteWithLocks(nextPalette, prev, lockedPalette));
-      }
-      setIsProcessing(false);
-      setGuidedStep((prev) => Math.max(prev, 3));
-      commitRenderMetrics("main-thread");
-      setError(null);
-    } catch {
-      setIsProcessing(false);
-      setError("No pudimos generar el mosaico.");
-    }
+    renderModeRef.current = "main-thread";
+    renderOnMainThread(sourceCanvas, mosaicCanvas);
+    setIsProcessing(false);
   }, [
     commitRenderMetrics,
     colorCount,
@@ -592,8 +655,8 @@ export default function Home() {
     customPaletteRgb,
     dithering,
     hasImage,
-    lockedPalette,
     renderCachedResult,
+    renderOnMainThread,
     showGrout,
     style,
     tileSize,
